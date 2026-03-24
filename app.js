@@ -12,6 +12,7 @@ const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const url = require('url');
@@ -28,7 +29,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Multer for multipart/form-data (profile avatar uploads, etc.)
-const upload = multer({ dest: path.join(__dirname, 'uploads') });
+const upload = multer({ dest: path.join(os.tmpdir(), 'turbocar-uploads') });
 
 // Request logger
 app.use((req, res, next) => {
