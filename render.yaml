@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: turbocar-server
+    env: node
+    buildCommand: npm install
+    startCommand: node app.js
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_ACCESS_EXPIRY
+        sync: false
+      - key: JWT_REFRESH_EXPIRY
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_PUBLIC_URL
+        sync: false

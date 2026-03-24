@@ -1611,12 +1611,8 @@ app.use((err, req, res, next) => {
     res.status(500).json({ message: 'Internal Server Error' });
 });
 
-if (process.env.NODE_ENV !== 'production') {
-    server.listen(PORT, () => {
-        console.log(`\n🚀 TurboCar Server running at http://localhost:${PORT}`);
-        console.log(`🔌 WebSocket server active on ws://localhost:${PORT}`);
-        console.log(`🗄️  Database: PostgreSQL (Supabase)`);
-    });
-}
-
-module.exports = app;
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n🚀 TurboCar Server running at port ${PORT}`);
+    console.log(`🔌 WebSocket server active on ws://localhost:${PORT}`);
+    console.log(`🗄️  Database: PostgreSQL (Supabase)`);
+});
