@@ -1165,13 +1165,19 @@ app.get('/conversations', async (req, res) => {
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     try {
-        // Coerce the JSONB unread count for this specific user into an integer column.
+        // JOIN users table to get fresh buyer/seller names and avatars.
         const result = await pool.query(
-            `SELECT *,
-                    COALESCE((unread_counts ->> $1)::int, 0) AS unread_count
-             FROM  conversations
-             WHERE buyer_id = $1 OR seller_id = $1
-             ORDER BY last_message_at DESC NULLS LAST`,
+            `SELECT c.*,
+                    COALESCE((c.unread_counts ->> $1)::int, 0) AS unread_count,
+                    TRIM(COALESCE(b.user_firstname, '') || ' ' || COALESCE(b.user_lastname, '')) AS buyer_name,
+                    b.user_avatar_url AS buyer_avatar_url,
+                    TRIM(COALESCE(s.user_firstname, '') || ' ' || COALESCE(s.user_lastname, '')) AS seller_name,
+                    s.user_avatar_url AS seller_avatar_url
+             FROM  conversations c
+             LEFT JOIN users b ON c.buyer_id  = b.user_id
+             LEFT JOIN users s ON c.seller_id = s.user_id
+             WHERE c.buyer_id = $1 OR c.seller_id = $1
+             ORDER BY c.last_message_at DESC NULLS LAST`,
             [userId]
         );
 
@@ -1198,13 +1204,20 @@ app.post('/conversations', async (req, res) => {
 
     try {
         // Return existing conversation for this buyer/seller/listing triple
+        // JOIN users to attach fresh buyer/seller names and avatars.
         const existing = await pool.query(
-            `SELECT *,
-                    COALESCE((unread_counts ->> $1)::int, 0) AS unread_count
-             FROM  conversations
-             WHERE buyer_id = $1
-               AND seller_id = $2
-               AND car_reference ->> 'listing_id' = $3
+            `SELECT c.*,
+                    COALESCE((c.unread_counts ->> $1)::int, 0) AS unread_count,
+                    TRIM(COALESCE(b.user_firstname, '') || ' ' || COALESCE(b.user_lastname, '')) AS buyer_name,
+                    b.user_avatar_url AS buyer_avatar_url,
+                    TRIM(COALESCE(s.user_firstname, '') || ' ' || COALESCE(s.user_lastname, '')) AS seller_name,
+                    s.user_avatar_url AS seller_avatar_url
+             FROM  conversations c
+             LEFT JOIN users b ON c.buyer_id  = b.user_id
+             LEFT JOIN users s ON c.seller_id = s.user_id
+             WHERE c.buyer_id = $1
+               AND c.seller_id = $2
+               AND c.car_reference ->> 'listing_id' = $3
              LIMIT 1`,
             [userId, seller_id, listing_id]
         );
@@ -1238,22 +1251,18 @@ app.post('/conversations', async (req, res) => {
 
         const unreadCounts = { [userId]: 0, [seller_id]: 0 };
 
+        // Insert WITHOUT buyer/seller name/avatar — those columns are removed.
         const result = await pool.query(
             `INSERT INTO conversations
-               (id, buyer_id, buyer_name, buyer_avatar_url,
-                seller_id, seller_name, seller_avatar_url,
+               (id, buyer_id, seller_id,
                 car_reference, last_message_preview, last_message_at,
                 unread_counts, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
              RETURNING *`,
             [
                 convId,
                 userId,
-                buyer ? `${buyer.user_firstname} ${buyer.user_lastname}`.trim() : 'Buyer',
-                buyer ? buyer.user_avatar_url : null,
                 seller_id,
-                seller ? `${seller.user_firstname} ${seller.user_lastname}`.trim() : 'Seller',
-                seller ? seller.user_avatar_url : null,
                 JSON.stringify(carReference),
                 null,
                 null,
@@ -1262,7 +1271,22 @@ app.post('/conversations', async (req, res) => {
             ]
         );
 
-        const newConversation = { ...result.rows[0], unread_count: 0 };
+        // Attach dynamic user info to the response (mirrors the JOIN shape).
+        const buyerName = buyer
+            ? `${buyer.user_firstname} ${buyer.user_lastname}`.trim()
+            : 'Buyer';
+        const sellerName = seller
+            ? `${seller.user_firstname} ${seller.user_lastname}`.trim()
+            : 'Seller';
+
+        const newConversation = {
+            ...result.rows[0],
+            unread_count: 0,
+            buyer_name: buyerName,
+            buyer_avatar_url: buyer ? buyer.user_avatar_url : null,
+            seller_name: sellerName,
+            seller_avatar_url: seller ? seller.user_avatar_url : null,
+        };
         console.log(`✅ Conversation Created: ${convId}`);
 
         // Notify the seller in real-time
@@ -1389,25 +1413,34 @@ app.post('/conversations/:id/messages', async (req, res) => {
         broadcastToUser(recipientId, 'message.new', newMessage);
 
         // Atomically increment recipient's unread counter in JSONB
-        const updatedConvRes = await pool.query(
+        await pool.query(
             `UPDATE conversations
              SET unread_counts = jsonb_set(
                  COALESCE(unread_counts, '{}'::jsonb),
                  ARRAY[$1::text],
                  to_jsonb(COALESCE((unread_counts ->> $1)::int, 0) + 1)
              )
-             WHERE id = $2
-             RETURNING *,
-                 COALESCE((unread_counts ->> $1)::int, 0) AS unread_count`,
+             WHERE id = $2`,
+            [recipientId, conversationId]
+        );
+
+        // Re-fetch the conversation with JOINed user info for the broadcast.
+        const updatedConvRes = await pool.query(
+            `SELECT c.*,
+                    COALESCE((c.unread_counts ->> $1)::int, 0) AS unread_count,
+                    TRIM(COALESCE(b.user_firstname, '') || ' ' || COALESCE(b.user_lastname, '')) AS buyer_name,
+                    b.user_avatar_url AS buyer_avatar_url,
+                    TRIM(COALESCE(s.user_firstname, '') || ' ' || COALESCE(s.user_lastname, '')) AS seller_name,
+                    s.user_avatar_url AS seller_avatar_url
+             FROM  conversations c
+             LEFT JOIN users b ON c.buyer_id  = b.user_id
+             LEFT JOIN users s ON c.seller_id = s.user_id
+             WHERE c.id = $2`,
             [recipientId, conversationId]
         );
 
         if (updatedConvRes.rowCount > 0) {
-            const latestConv = updatedConvRes.rows[0];
-            broadcastToUser(recipientId, 'conversation.updated', {
-                ...latestConv,
-                unread_count: (latestConv.unread_counts?.[recipientId]) || 0,
-            });
+            broadcastToUser(recipientId, 'conversation.updated', updatedConvRes.rows[0]);
         }
 
         return res.status(201).json(newMessage);
