@@ -738,6 +738,9 @@ const CAR_UPDATABLE_FIELDS = [
 
 // PATCH /cars/:id — edit an existing listing
 app.patch('/cars/:id', upload.array('new_images', 10), async (req, res) => {
+    const userId = extractUserId(req);
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
     console.log(`✅ Car API Hit (PATCH Update) id=${req.params.id}`);
     try {
         const carId = req.params.id;
@@ -747,6 +750,11 @@ app.patch('/cars/:id', upload.array('new_images', 10), async (req, res) => {
         if (existing.rowCount === 0) return res.status(404).json({ message: 'Car not found' });
 
         const car = existing.rows[0];
+
+        // Ownership check — only the seller can edit their listing
+        if (car.seller_id !== userId) {
+            return res.status(403).json({ message: 'You are not authorized to edit this listing' });
+        }
         const {
             car_type, brand, model, fuel_type,
             mileage, year, price, chat_only,
