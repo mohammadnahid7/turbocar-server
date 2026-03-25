@@ -228,6 +228,7 @@ function formatCarResponse(car) {
         seats: car.seats != null ? parseInt(car.seats, 10) : 0,
         view_count: car.view_count != null ? parseInt(car.view_count, 10) : 0,
         previous_owners: car.previous_owners != null ? parseInt(car.previous_owners, 10) : 0,
+        seller_avatar: car.seller_avatar || null,
     };
 }
 
@@ -591,8 +592,10 @@ const CAR_FAVORITE_SELECT = (userId) => `
 // Parameterised version used when userId comes alongside other bound params.
 const carFavJoin = `
     SELECT c.*,
+           u.user_avatar_url AS seller_avatar,
            CASE WHEN f.car_id IS NOT NULL THEN true ELSE false END AS is_favorited
     FROM   cars c
+    LEFT JOIN users u ON u.user_id = c.seller_id
     LEFT JOIN favorites f ON f.car_id = c.id AND f.user_id = $1
 `;
 
