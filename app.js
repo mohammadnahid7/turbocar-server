@@ -1172,10 +1172,19 @@ app.get('/conversations', async (req, res) => {
                     TRIM(COALESCE(b.user_firstname, '') || ' ' || COALESCE(b.user_lastname, '')) AS buyer_name,
                     b.user_avatar_url AS buyer_avatar_url,
                     TRIM(COALESCE(s.user_firstname, '') || ' ' || COALESCE(s.user_lastname, '')) AS seller_name,
-                    s.user_avatar_url AS seller_avatar_url
+                    s.user_avatar_url AS seller_avatar_url,
+                    lm.sender_id AS last_message_sender_id,
+                    (lm.status = 'read') AS last_message_is_read
              FROM  conversations c
              LEFT JOIN users b ON c.buyer_id  = b.user_id
              LEFT JOIN users s ON c.seller_id = s.user_id
+             LEFT JOIN LATERAL (
+                 SELECT sender_id, status
+                 FROM messages m
+                 WHERE m.conversation_id = c.id
+                 ORDER BY m.created_at DESC
+                 LIMIT 1
+             ) lm ON true
              WHERE c.buyer_id = $1 OR c.seller_id = $1
              ORDER BY c.last_message_at DESC NULLS LAST`,
             [userId]
@@ -1211,10 +1220,19 @@ app.post('/conversations', async (req, res) => {
                     TRIM(COALESCE(b.user_firstname, '') || ' ' || COALESCE(b.user_lastname, '')) AS buyer_name,
                     b.user_avatar_url AS buyer_avatar_url,
                     TRIM(COALESCE(s.user_firstname, '') || ' ' || COALESCE(s.user_lastname, '')) AS seller_name,
-                    s.user_avatar_url AS seller_avatar_url
+                    s.user_avatar_url AS seller_avatar_url,
+                    lm.sender_id AS last_message_sender_id,
+                    (lm.status = 'read') AS last_message_is_read
              FROM  conversations c
              LEFT JOIN users b ON c.buyer_id  = b.user_id
              LEFT JOIN users s ON c.seller_id = s.user_id
+             LEFT JOIN LATERAL (
+                 SELECT sender_id, status
+                 FROM messages m
+                 WHERE m.conversation_id = c.id
+                 ORDER BY m.created_at DESC
+                 LIMIT 1
+             ) lm ON true
              WHERE c.buyer_id = $1
                AND c.seller_id = $2
                AND c.car_reference ->> 'listing_id' = $3
@@ -1286,6 +1304,8 @@ app.post('/conversations', async (req, res) => {
             buyer_avatar_url: buyer ? buyer.user_avatar_url : null,
             seller_name: sellerName,
             seller_avatar_url: seller ? seller.user_avatar_url : null,
+            last_message_sender_id: null,
+            last_message_is_read: false,
         };
         console.log(`✅ Conversation Created: ${convId}`);
 
@@ -1431,10 +1451,19 @@ app.post('/conversations/:id/messages', async (req, res) => {
                     TRIM(COALESCE(b.user_firstname, '') || ' ' || COALESCE(b.user_lastname, '')) AS buyer_name,
                     b.user_avatar_url AS buyer_avatar_url,
                     TRIM(COALESCE(s.user_firstname, '') || ' ' || COALESCE(s.user_lastname, '')) AS seller_name,
-                    s.user_avatar_url AS seller_avatar_url
+                    s.user_avatar_url AS seller_avatar_url,
+                    lm.sender_id AS last_message_sender_id,
+                    (lm.status = 'read') AS last_message_is_read
              FROM  conversations c
              LEFT JOIN users b ON c.buyer_id  = b.user_id
              LEFT JOIN users s ON c.seller_id = s.user_id
+             LEFT JOIN LATERAL (
+                 SELECT sender_id, status
+                 FROM messages m
+                 WHERE m.conversation_id = c.id
+                 ORDER BY m.created_at DESC
+                 LIMIT 1
+             ) lm ON true
              WHERE c.id = $2`,
             [recipientId, conversationId]
         );
