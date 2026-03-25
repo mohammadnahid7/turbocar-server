@@ -1510,14 +1510,7 @@ app.post('/conversations/:id/read', async (req, res) => {
         // Notify each original sender that their messages were read
         const notifiedSenders = new Set();
         for (const msg of updatedMsgs.rows) {
-            if (!notifiedSenders.has(msg.sender_id)) {
-                broadcastToUser(msg.sender_id, 'message.status', {
-                    conversation_id: conversationId,
-                    local_id: msg.local_id,
-                    status: 'read',
-                });
-                notifiedSenders.add(msg.sender_id);
-            }
+            notifiedSenders.add(msg.sender_id);
         }
 
         // Reset only the current user's unread counter to 0
@@ -1531,6 +1524,38 @@ app.post('/conversations/:id/read', async (req, res) => {
              WHERE id = $2`,
             [userId, conversationId]
         );
+
+        // Broadcast a fresh conversation snapshot to each sender so their
+        // conversation list updates the read indicator in real-time.
+        if (notifiedSenders.size > 0) {
+            for (const senderId of notifiedSenders) {
+                const freshConv = await pool.query(
+                    `SELECT c.*,
+                            COALESCE((c.unread_counts ->> $1)::int, 0) AS unread_count,
+                            TRIM(COALESCE(b.user_firstname, '') || ' ' || COALESCE(b.user_lastname, '')) AS buyer_name,
+                            b.user_avatar_url AS buyer_avatar_url,
+                            TRIM(COALESCE(s.user_firstname, '') || ' ' || COALESCE(s.user_lastname, '')) AS seller_name,
+                            s.user_avatar_url AS seller_avatar_url,
+                            lm.sender_id AS last_message_sender_id,
+                            (lm.status = 'read') AS last_message_is_read
+                     FROM  conversations c
+                     LEFT JOIN users b ON c.buyer_id  = b.user_id
+                     LEFT JOIN users s ON c.seller_id = s.user_id
+                     LEFT JOIN LATERAL (
+                         SELECT sender_id, status
+                         FROM messages m
+                         WHERE m.conversation_id = c.id
+                         ORDER BY m.created_at DESC
+                         LIMIT 1
+                     ) lm ON true
+                     WHERE c.id = $2`,
+                    [senderId, conversationId]
+                );
+                if (freshConv.rowCount > 0) {
+                    broadcastToUser(senderId, 'conversation.updated', freshConv.rows[0]);
+                }
+            }
+        }
 
         console.log(`✅ Messages marked as read in ${conversationId} by ${userId}`);
         return res.status(200).json({ message: 'Messages marked as read' });
