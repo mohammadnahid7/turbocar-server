@@ -1696,7 +1696,155 @@ function broadcastToUser(userId, type, payload) {
 }
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  NOTIFICATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Central notification dispatcher.
+ * Saves to DB → broadcasts via WebSocket → (future) sends FCM push.
+ */
+async function sendNotification({ userId, type, title, body, data = {} }) {
+    try {
+        const result = await pool.query(
+            `INSERT INTO notifications (user_id, type, title, body, data)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING *`,
+            [userId, type, title, body, JSON.stringify(data)]
+        );
+        const notification = result.rows[0];
+
+        // Real-time delivery via WebSocket
+        broadcastToUser(userId, 'notification.new', notification);
+
+        console.log(`🔔 Notification sent to ${userId}: [${type}] ${title}`);
+        return notification;
+    } catch (err) {
+        console.error('❌ sendNotification error:', err.message);
+    }
+}
+
+// GET /notifications — fetch paginated notifications for the authenticated user
+app.get('/notifications', async (req, res) => {
+    const userId = extractUserId(req);
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 30;
+    const offset = (page - 1) * limit;
+
+    try {
+        const result = await pool.query(
+            `SELECT * FROM notifications
+             WHERE user_id = $1
+             ORDER BY created_at DESC
+             LIMIT $2 OFFSET $3`,
+            [userId, limit, offset]
+        );
+
+        const countResult = await pool.query(
+            'SELECT COUNT(*) FROM notifications WHERE user_id = $1',
+            [userId]
+        );
+
+        const unreadResult = await pool.query(
+            'SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND is_read = false',
+            [userId]
+        );
+
+        return res.status(200).json({
+            notifications: result.rows,
+            total: parseInt(countResult.rows[0].count),
+            unread_count: parseInt(unreadResult.rows[0].count),
+            page,
+            limit,
+        });
+    } catch (err) {
+        console.error('❌ GET /notifications error:', err.message);
+        return res.status(500).json({ message: 'Failed to fetch notifications' });
+    }
+});
+
+// PATCH /notifications/:id/read — mark a single notification as read
+app.patch('/notifications/:id/read', async (req, res) => {
+    const userId = extractUserId(req);
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    try {
+        const result = await pool.query(
+            `UPDATE notifications SET is_read = true
+             WHERE id = $1 AND user_id = $2
+             RETURNING *`,
+            [req.params.id, userId]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ message: 'Notification not found' });
+        return res.status(200).json(result.rows[0]);
+    } catch (err) {
+        console.error('❌ PATCH /notifications/:id/read error:', err.message);
+        return res.status(500).json({ message: 'Failed to mark notification as read' });
+    }
+});
+
+// PATCH /notifications/read-all — mark all notifications as read
+app.patch('/notifications/read-all', async (req, res) => {
+    const userId = extractUserId(req);
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    try {
+        await pool.query(
+            'UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false',
+            [userId]
+        );
+        return res.status(200).json({ message: 'All notifications marked as read' });
+    } catch (err) {
+        console.error('❌ PATCH /notifications/read-all error:', err.message);
+        return res.status(500).json({ message: 'Failed to mark all as read' });
+    }
+});
+
+// DELETE /notifications/:id — delete a notification
+app.delete('/notifications/:id', async (req, res) => {
+    const userId = extractUserId(req);
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    try {
+        const result = await pool.query(
+            'DELETE FROM notifications WHERE id = $1 AND user_id = $2',
+            [req.params.id, userId]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ message: 'Notification not found' });
+        return res.status(200).json({ message: 'Notification deleted' });
+    } catch (err) {
+        console.error('❌ DELETE /notifications/:id error:', err.message);
+        return res.status(500).json({ message: 'Failed to delete notification' });
+    }
+});
+
+// POST /device-tokens — register a device token for push notifications
+app.post('/device-tokens', async (req, res) => {
+    const userId = extractUserId(req);
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const { token, platform } = req.body;
+    if (!token) return res.status(400).json({ message: 'Token is required' });
+
+    try {
+        await pool.query(
+            `INSERT INTO user_device_tokens (token, user_id, platform, updated_at)
+             VALUES ($1, $2, $3, NOW())
+             ON CONFLICT (token) DO UPDATE SET user_id = $2, platform = $3, updated_at = NOW()`,
+            [token, userId, platform || 'unknown']
+        );
+        return res.status(200).json({ message: 'Device token registered' });
+    } catch (err) {
+        console.error('❌ POST /device-tokens error:', err.message);
+        return res.status(500).json({ message: 'Failed to register device token' });
+    }
+});
+
+
 // ─── Root & Error Handling ────────────────────────────────────────────────────
+
 
 app.get('/', (req, res) => {
     return res.status(200).json({ message: 'TurboCar Server Running', wsEnabled: true, db: 'PostgreSQL' });
