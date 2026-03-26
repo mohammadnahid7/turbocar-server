@@ -1020,21 +1020,21 @@ app.post('/favorites', async (req, res) => {
             const carQuery = await pool.query('SELECT seller_id, title FROM cars WHERE id = $1', [car_id]);
             if (carQuery.rowCount > 0) {
                 const car = carQuery.rows[0];
-                if (car.seller_id !== userId) {
+                if (car.seller_id && car.seller_id !== userId) {
                     const userQuery = await pool.query('SELECT first_name FROM users WHERE id = $1', [userId]);
                     const userName = userQuery.rowCount > 0 && userQuery.rows[0].first_name ? userQuery.rows[0].first_name : 'Someone';
-                    
-                    sendNotification({
+
+                    await sendNotification({
                         userId: car.seller_id,
                         type: 'CAR_FAVORITED',
                         title: 'New Favorite! ❤️',
                         body: `${userName} favorited your ${car.title}`,
                         data: { carId: car_id, route: `/car/${car_id}` }
-                    }).catch(err => console.error('Notification failed:', err));
+                    });
                 }
             }
         } catch (notifErr) {
-            console.error('❌ Failed to process favorite notification:', notifErr);
+            console.error('❌ Favorite notification error:', notifErr.message);
         }
 
         return res.status(201).json({ favorite: result.rows[0] });
