@@ -19,6 +19,25 @@ const url = require('url');
 const jwt = require('jsonwebtoken');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { Pool } = require('pg');
+const admin = require('firebase-admin');
+
+// ─── Firebase Admin SDK Initialization ───────────────────────────────────────
+let firebaseAdminInitialized = false;
+try {
+    const serviceAccountPath = path.join(__dirname, 'firebase-service-account.json');
+    if (fs.existsSync(serviceAccountPath)) {
+        const serviceAccount = require(serviceAccountPath);
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        firebaseAdminInitialized = true;
+        console.log('✅ Firebase Admin SDK initialized successfully');
+    } else {
+        console.warn('⚠️ firebase-service-account.json not found! Push notifications will be disabled.');
+    }
+} catch (err) {
+    console.error('❌ Failed to initialize Firebase Admin SDK:', err.message);
+}
 
 const app = express();
 const PORT = process.env.PORT || 3339;
@@ -879,6 +898,45 @@ app.get('/cars/search', async (req, res) => {
     }
 });
 
+app.get('/cars/suggestions', async (req, res) => {
+    const query = (req.query.q || '').trim().toLowerCase();
+    const limit = Math.min(parseInt(req.query.limit) || 10, 20);
+
+    // Edge case: empty or missing query — return immediately
+    if (!query) {
+        return res.status(200).json({ suggestions: [] });
+    }
+
+    try {
+        const likeQuery = `${query}%`; // Prefix only — no leading wildcard
+
+        const result = await pool.query(
+            `SELECT DISTINCT text, type FROM (
+                SELECT DISTINCT brand AS text, 'brand' AS type
+                FROM cars
+                WHERE lower(brand) LIKE $1
+                UNION
+                SELECT DISTINCT model AS text, 'model' AS type
+                FROM cars
+                WHERE lower(model) LIKE $1
+            ) AS combined
+            ORDER BY text
+            LIMIT $2`,
+            [likeQuery, limit]
+        );
+
+        return res.status(200).json({
+            suggestions: result.rows.map(row => ({
+                type: row.type,
+                text: row.text,
+            })),
+        });
+    } catch (err) {
+        console.error('❌ GET /cars/suggestions error:', err);
+        return res.status(500).json({ message: 'Suggestions failed: ' + err.message });
+    }
+});
+
 app.get('/cars/brand/:brand', async (req, res) => {
     const brand = decodeURIComponent(req.params.brand);
     const page = parseInt(req.query.page) || 1;
@@ -1021,8 +1079,8 @@ app.post('/favorites', async (req, res) => {
             if (carQuery.rowCount > 0) {
                 const car = carQuery.rows[0];
                 if (car.seller_id && car.seller_id !== userId) {
-                    const userQuery = await pool.query('SELECT first_name FROM users WHERE id = $1', [userId]);
-                    const userName = userQuery.rowCount > 0 && userQuery.rows[0].first_name ? userQuery.rows[0].first_name : 'Someone';
+                    const userQuery = await pool.query('SELECT user_firstname, user_lastname FROM users WHERE user_id = $1', [userId]);
+                    const userName = userQuery.rowCount > 0 && userQuery.rows[0].user_firstname ? userQuery.rows[0].user_firstname + ' ' + userQuery.rows[0].user_lastname : 'Someone';
 
                     await sendNotification({
                         userId: car.seller_id,
@@ -1737,10 +1795,43 @@ async function sendNotification({ userId, type, title, body, data = {} }) {
         );
         const notification = result.rows[0];
 
-        // Real-time delivery via WebSocket
+        // 1. Real-time delivery via WebSocket (In-App)
         broadcastToUser(userId, 'notification.new', notification);
 
-        console.log(`🔔 Notification sent to ${userId}: [${type}] ${title}`);
+        // 2. Push Notification delivery via Firebase (Background)
+        if (firebaseAdminInitialized) {
+            try {
+                // Fetch user device tokens
+                const tokensResult = await pool.query(
+                    'SELECT token FROM user_device_tokens WHERE user_id = $1',
+                    [userId]
+                );
+
+                if (tokensResult.rowCount > 0) {
+                    const tokens = tokensResult.rows.map(row => row.token);
+
+                    const message = {
+                        notification: {
+                            title: title,
+                            body: body
+                        },
+                        data: Object.fromEntries(
+                            Object.entries(data).map(([key, val]) => [key, String(val)]) // FCM data values must be strings
+                        ),
+                        tokens: tokens
+                    };
+
+                    const response = await admin.messaging().sendEachForMulticast(message);
+                    console.log(`📨 FCM pushed to ${response.successCount} devices, ${response.failureCount} failed.`);
+
+                    // Optional: Clean up failed tokens if needed in the future
+                }
+            } catch (fcmErr) {
+                console.error('❌ FCM dispatch error:', fcmErr.message);
+            }
+        }
+
+        console.log(`🔔 Notification processed for ${userId}: [${type}] ${title}`);
         return notification;
     } catch (err) {
         console.error('❌ sendNotification error:', err.message);
