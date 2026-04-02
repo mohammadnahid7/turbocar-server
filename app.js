@@ -24,16 +24,15 @@ const admin = require('firebase-admin');
 // ─── Firebase Admin SDK Initialization ───────────────────────────────────────
 let firebaseAdminInitialized = false;
 try {
-    const serviceAccountPath = path.join(__dirname, 'firebase-service-account.json');
-    if (fs.existsSync(serviceAccountPath)) {
-        const serviceAccount = require(serviceAccountPath);
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount)
         });
         firebaseAdminInitialized = true;
-        console.log('✅ Firebase Admin SDK initialized successfully');
+        console.log('✅ Firebase Admin SDK initialized successfully (via .env)');
     } else {
-        console.warn('⚠️ firebase-service-account.json not found! Push notifications will be disabled.');
+        console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT not found in .env! Push notifications will be disabled.');
     }
 } catch (err) {
     console.error('❌ Failed to initialize Firebase Admin SDK:', err.message);
