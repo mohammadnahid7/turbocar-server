@@ -1,0 +1,12 @@
+.gitignore
+node_modules
+.env
+.env.*
+server.js
+uploads/
+db.json
+cars.json
+firebase-service-account.json
+plans/
+vercel.json
+*.sql
