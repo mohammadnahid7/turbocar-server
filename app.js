@@ -17,6 +17,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const url = require('url');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { Pool } = require('pg');
 const admin = require('firebase-admin');
@@ -85,6 +86,7 @@ pool.query('SELECT NOW()')
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_ACCESS_EXPIRY = process.env.JWT_ACCESS_EXPIRY || '1h';
 const JWT_REFRESH_EXPIRY = process.env.JWT_REFRESH_EXPIRY || '7d';
+const BCRYPT_SALT_ROUNDS = 12;
 
 if (!JWT_SECRET) {
     console.error('❌ FATAL: JWT_SECRET is not set in .env — server cannot start securely.');
@@ -173,11 +175,11 @@ async function deleteFromR2(fileUrl) {
 }
 
 // ─── Helper: generate real JWT tokens ───────────────────────────────────────
-function generateTokens(userId) {
+function generateTokens(userId, tokenVersion = 0) {
     const access_token = jwt.sign({ sub: userId, type: 'access' }, JWT_SECRET, {
         expiresIn: JWT_ACCESS_EXPIRY,
     });
-    const refresh_token = jwt.sign({ sub: userId, type: 'refresh' }, JWT_SECRET, {
+    const refresh_token = jwt.sign({ sub: userId, type: 'refresh', v: tokenVersion }, JWT_SECRET, {
         expiresIn: JWT_REFRESH_EXPIRY,
     });
     const decoded = jwt.decode(access_token);
@@ -317,8 +319,18 @@ app.post('/auth/login', async (req, res) => {
         }
 
         const user = result.rows[0];
+
+        // ── Password verification (bcrypt) ──────────────────────────────
+        if (!user.password_hash) {
+            return res.status(401).json({ message: 'Account requires password reset. Please re-register.' });
+        }
+        const passwordValid = await bcrypt.compare(user_password, user.password_hash);
+        if (!passwordValid) {
+            return res.status(401).json({ message: 'Invalid email or password' });
+        }
+
         console.log(`✅ Login Success for: ${user_email}`);
-        const tokens = generateTokens(user.user_id);
+        const tokens = generateTokens(user.user_id, user.token_version || 0);
         return res.status(200).json({ ...tokens, user: buildUserResponse(user) });
     } catch (err) {
         console.error('❌ Login error:', err);
@@ -331,10 +343,15 @@ app.post('/auth/register', upload.single('user_avatar_url'), async (req, res) =>
         const {
             user_email, email,
             user_firstname, user_lastname,
-            user_phone, user_role,
+            user_phone, user_password,
             user_dob, user_gender,
         } = req.body;
         const finalEmail = user_email || email;
+
+        // ── Validate password is present and meets minimum length ────────
+        if (!user_password || user_password.length < 8) {
+            return res.status(400).json({ message: 'Password is required and must be at least 8 characters' });
+        }
 
         // Return existing user if already registered (idempotent)
         const existing = await pool.query(
@@ -342,8 +359,7 @@ app.post('/auth/register', upload.single('user_avatar_url'), async (req, res) =>
             [finalEmail]
         );
         if (existing.rowCount > 0) {
-            const tokens = generateTokens(existing.rows[0].user_id);
-            return res.status(200).json({ ...tokens, user: buildUserResponse(existing.rows[0]) });
+            return res.status(409).json({ message: 'An account with this email already exists. Please login.' });
         }
 
         let avatarUrl = null;
@@ -352,6 +368,9 @@ app.post('/auth/register', upload.single('user_avatar_url'), async (req, res) =>
             console.log(`  📸 Avatar uploaded: ${req.file.originalname}`);
         }
 
+        // ── Hash password with bcrypt ────────────────────────────────────
+        const passwordHash = await bcrypt.hash(user_password, BCRYPT_SALT_ROUNDS);
+
         const userId = 'user_' + Date.now();
         const now = new Date().toISOString();
 
@@ -359,8 +378,9 @@ app.post('/auth/register', upload.single('user_avatar_url'), async (req, res) =>
             `INSERT INTO users
                (user_id, user_firstname, user_lastname, user_phone, user_email,
                 user_avatar_url, user_dob, user_gender, user_role,
-                user_is_verified, user_created_at, user_updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                user_is_verified, password_hash, token_version,
+                user_created_at, user_updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
              RETURNING *`,
             [
                 userId,
@@ -371,8 +391,10 @@ app.post('/auth/register', upload.single('user_avatar_url'), async (req, res) =>
                 avatarUrl,
                 user_dob || null,
                 user_gender || null,
-                user_role || 'buyer',
+                'buyer',            // ← Hardcoded role — prevents privilege escalation
                 true,
+                passwordHash,
+                0,                  // token_version starts at 0
                 now,
                 now,
             ]
@@ -380,7 +402,7 @@ app.post('/auth/register', upload.single('user_avatar_url'), async (req, res) =>
 
         const newUser = insert.rows[0];
         console.log(`✅ Register Success for: ${finalEmail}`);
-        const tokens = generateTokens(newUser.user_id);
+        const tokens = generateTokens(newUser.user_id, 0);
         return res.status(201).json({ ...tokens, user: buildUserResponse(newUser) });
     } catch (err) {
         console.error('❌ Register error:', err);
@@ -426,11 +448,34 @@ app.post('/auth/refresh', async (req, res) => {
         }
 
         const user = result.rows[0];
-        const tokens = generateTokens(user.user_id);
+
+        // ── Token version check — revokes old refresh tokens after logout ─
+        const currentVersion = user.token_version || 0;
+        const tokenVersion = payload.v !== undefined ? payload.v : 0;
+        if (tokenVersion !== currentVersion) {
+            return res.status(401).json({ message: 'Refresh token has been revoked' });
+        }
+
+        const tokens = generateTokens(user.user_id, currentVersion);
         console.log(`✅ Token Refreshed for: ${user.user_email}`);
         return res.status(200).json({ ...tokens, user: buildUserResponse(user) });
     } catch (e) {
         return res.status(401).json({ message: 'Invalid or expired refresh token' });
+    }
+});
+
+// POST /auth/logout — revoke all refresh tokens for the authenticated user
+app.post('/auth/logout', authenticateToken, async (req, res) => {
+    try {
+        await pool.query(
+            'UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE user_id = $1',
+            [req.userId]
+        );
+        console.log(`✅ Logout (tokens revoked) for: ${req.userId}`);
+        return res.status(200).json({ message: 'Logged out successfully' });
+    } catch (err) {
+        console.error('❌ Logout error:', err);
+        return res.status(500).json({ message: 'Logout failed: ' + err.message });
     }
 });
 
@@ -446,11 +491,12 @@ app.get('/auth/google/check', async (req, res) => {
         console.log('Existing User check:', googleId, 'found:', result.rowCount > 0);
 
         if (result.rowCount > 0) {
-            const tokens = generateTokens(result.rows[0].user_id);
+            const user = result.rows[0];
+            const tokens = generateTokens(user.user_id, user.token_version || 0);
             return res.status(200).json({
                 exists: true,
                 ...tokens,
-                user: buildUserResponse(result.rows[0]),
+                user: buildUserResponse(user),
             });
         }
 
@@ -468,8 +514,9 @@ app.post('/auth/google/register', upload.single('user_avatar_url'), async (req, 
             user_email, email,
             first_name, user_firstname,
             last_name, user_lastname,
-            user_phone, user_dob, user_gender, role,
+            user_phone, user_dob, user_gender,
         } = req.body;
+        // NOTE: `role` deliberately NOT destructured — prevents privilege escalation
 
         console.log('Payload:', req.body);
 
@@ -492,8 +539,8 @@ app.post('/auth/google/register', upload.single('user_avatar_url'), async (req, 
             `INSERT INTO users
                (user_id, user_firstname, user_lastname, user_phone, user_email,
                 user_dob, user_gender, user_role, user_avatar_url,
-                user_is_verified, user_created_at, user_updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                user_is_verified, token_version, user_created_at, user_updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
              ON CONFLICT (user_id) DO UPDATE SET
                user_firstname  = EXCLUDED.user_firstname,
                user_lastname   = EXCLUDED.user_lastname,
@@ -508,9 +555,10 @@ app.post('/auth/google/register', upload.single('user_avatar_url'), async (req, 
                 finalEmail,
                 user_dob || null,
                 user_gender || null,
-                role || 'buyer',
+                'buyer',            // ← Hardcoded role — prevents privilege escalation
                 avatarUrl,
                 true,
+                0,                  // token_version
                 now,
                 now,
             ]
@@ -518,7 +566,7 @@ app.post('/auth/google/register', upload.single('user_avatar_url'), async (req, 
 
         const newUser = result.rows[0];
         console.log(`✅ Google Register Success for: ${finalEmail}`);
-        const tokens = generateTokens(newUser.user_id);
+        const tokens = generateTokens(newUser.user_id, newUser.token_version || 0);
         return res.status(201).json({ ...tokens, user: buildUserResponse(newUser) });
     } catch (err) {
         console.error('❌ Google Register error:', err);
@@ -669,19 +717,11 @@ app.get('/cars', async (req, res) => {
     }
 });
 
-app.post('/cars', upload.array('images', 10), async (req, res) => {
+app.post('/cars', authenticateToken, upload.array('images', 10), async (req, res) => {
     console.log('✅ Car API Hit (POST Create)');
     try {
-        // Extract seller_id from auth token
-        let sellerId = 'unknown_seller';
-        const authHeader = req.headers['authorization'];
-        if (authHeader) {
-            try {
-                const tokenPart = authHeader.replace('Bearer ', '').split('.')[1];
-                const payload = JSON.parse(Buffer.from(tokenPart, 'base64').toString());
-                sellerId = payload.sub;
-            } catch (e) { /* ignore */ }
-        }
+        // seller_id is now securely extracted via authenticateToken middleware
+        const sellerId = req.userId;
 
         const {
             car_type, brand, model, fuel_type,
