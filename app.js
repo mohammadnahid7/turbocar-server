@@ -17,7 +17,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const url = require('url');
 const jwt = require('jsonwebtoken');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { Pool } = require('pg');
 const admin = require('firebase-admin');
 
@@ -148,6 +148,29 @@ async function uploadToR2(file, folderPrefix = '') {
     });
 
     return `${R2_PUBLIC_URL}/${uniqueKey}`;
+}
+
+/**
+ * Delete a file from Cloudflare R2 by its public URL.
+ * Silently fails — cleanup is best-effort, never blocks the caller.
+ *
+ * @param {string} fileUrl - Full public URL returned by uploadToR2
+ */
+async function deleteFromR2(fileUrl) {
+    if (!r2Enabled || !s3Client || !fileUrl) return;
+    try {
+        // Extract the key from the public URL (everything after the R2_PUBLIC_URL prefix)
+        const key = fileUrl.replace(`${R2_PUBLIC_URL}/`, '');
+        if (!key || key === fileUrl) return; // Not an R2 URL
+
+        await s3Client.send(new DeleteObjectCommand({
+            Bucket: R2_BUCKET_NAME,
+            Key: key,
+        }));
+        console.log(`  🗑️  Deleted from R2: ${key}`);
+    } catch (err) {
+        console.warn(`  ⚠️  R2 cleanup failed for ${fileUrl}: ${err.message}`);
+    }
 }
 
 // ─── Helper: generate real JWT tokens ───────────────────────────────────────
@@ -1953,6 +1976,471 @@ app.post('/device-tokens', async (req, res) => {
     } catch (err) {
         console.error('❌ POST /device-tokens error:', err.message);
         return res.status(500).json({ message: 'Failed to register device token' });
+    }
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ADS / CAMPAIGN ROUTES (v1)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Campaign-specific Multer with MIME + size validation ────────────────────
+const ALLOWED_THUMBNAIL_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
+const ALLOWED_MEDIA_MIMES = ['video/mp4', 'video/webm', 'video/quicktime'];
+const MAX_THUMBNAIL_SIZE = 500 * 1024;       // 500 KB
+const MAX_MEDIA_SIZE = 50 * 1024 * 1024;     // 50 MB
+
+const campaignUpload = multer({
+    dest: path.join(os.tmpdir(), 'turbocar-uploads'),
+    limits: { fileSize: MAX_MEDIA_SIZE }, // global ceiling; per-field checked after
+    fileFilter: (req, file, cb) => {
+        if (file.fieldname === 'thumbnail') {
+            if (!ALLOWED_THUMBNAIL_MIMES.includes(file.mimetype)) {
+                return cb(new Error(`Invalid thumbnail type: ${file.mimetype}. Allowed: ${ALLOWED_THUMBNAIL_MIMES.join(', ')}`));
+            }
+        } else if (file.fieldname === 'media') {
+            if (!ALLOWED_MEDIA_MIMES.includes(file.mimetype)) {
+                return cb(new Error(`Invalid media type: ${file.mimetype}. Allowed: ${ALLOWED_MEDIA_MIMES.join(', ')}`));
+            }
+        }
+        cb(null, true);
+    },
+}).fields([
+    { name: 'media', maxCount: 1 },
+    { name: 'thumbnail', maxCount: 1 },
+]);
+
+/**
+ * Wraps campaignUpload to catch multer errors (size/type) and return 400.
+ */
+function campaignUploadMiddleware(req, res, next) {
+    campaignUpload(req, res, (err) => {
+        if (err) {
+            console.error('❌ Campaign upload validation error:', err.message);
+            return res.status(400).json({ message: err.message });
+        }
+        // Per-field size enforcement (multer limits is global, not per-field)
+        const thumbnailFile = req.files && req.files['thumbnail'] && req.files['thumbnail'][0];
+        if (thumbnailFile && thumbnailFile.size > MAX_THUMBNAIL_SIZE) {
+            // Clean up temp file
+            fs.unlink(thumbnailFile.path, () => { });
+            return res.status(400).json({ message: `Thumbnail exceeds maximum size of ${MAX_THUMBNAIL_SIZE / 1024}KB` });
+        }
+        next();
+    });
+}
+
+// ─── Middleware: require admin role ──────────────────────────────────────────
+async function requireAdmin(req, res, next) {
+    try {
+        const result = await pool.query(
+            'SELECT user_role FROM users WHERE user_id = $1 LIMIT 1',
+            [req.userId]
+        );
+        if (result.rowCount === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        if (result.rows[0].user_role !== 'admin') {
+            return res.status(403).json({ message: 'Forbidden: Admin access required' });
+        }
+        next();
+    } catch (err) {
+        console.error('❌ requireAdmin error:', err);
+        return res.status(500).json({ message: 'Authorization check failed' });
+    }
+}
+
+// ─── Target Validators (creation-time only) ─────────────────────────────────
+// Extensible registry: add new target types here without if/else chains.
+const TargetValidators = {
+    car: async (id) => {
+        const res = await pool.query(
+            'SELECT is_available FROM cars WHERE id = $1 LIMIT 1',
+            [id]
+        );
+        return res.rowCount > 0 && res.rows[0].is_available === true;
+    },
+    // Future: seller, brand, collection, etc.
+};
+
+// ─── Helper: format campaign for public API (camelCase) ─────────────────────
+function formatCampaignResponse(row) {
+    return {
+        campaignId: row.id,
+        targetType: row.target_type,
+        targetId: row.target_id,
+        mediaUrl: row.media_url,
+        mediaType: row.media_type,
+        thumbnailUrl: row.thumbnail_url || null,
+        priority: row.priority != null ? parseInt(row.priority, 10) : 0,
+    };
+}
+
+// ─── Admin: Create Campaign ─────────────────────────────────────────────────
+app.post('/admin/campaigns', authenticateToken, requireAdmin, campaignUploadMiddleware, async (req, res) => {
+    console.log('✅ Campaign API Hit (POST Create)');
+    try {
+        const {
+            target_type, target_id, media_type,
+            start_date, end_date, priority, source_type, status,
+        } = req.body;
+
+        // Validate required fields
+        if (!target_type || !target_id || !start_date || !end_date) {
+            return res.status(400).json({ message: 'target_type, target_id, start_date, and end_date are required' });
+        }
+
+        // Validate dates
+        const startParsed = new Date(start_date);
+        const endParsed = new Date(end_date);
+        if (isNaN(startParsed.getTime()) || isNaN(endParsed.getTime())) {
+            return res.status(400).json({ message: 'Invalid date format for start_date or end_date' });
+        }
+        if (endParsed <= startParsed) {
+            return res.status(400).json({ message: 'end_date must be after start_date' });
+        }
+
+        // Validate target exists using registry
+        const validator = TargetValidators[target_type];
+        if (!validator) {
+            return res.status(400).json({ message: `Unsupported target_type: ${target_type}` });
+        }
+        const targetValid = await validator(target_id);
+        if (!targetValid) {
+            return res.status(400).json({ message: `Target ${target_type} with id ${target_id} not found or unavailable` });
+        }
+
+        // ── Resolve media URL (file upload or body URL) ─────────────────
+        const mediaFile = req.files && req.files['media'] && req.files['media'][0];
+        let mediaUrl = req.body.media_url || null;
+        if (mediaFile) {
+            mediaUrl = await uploadToR2(mediaFile, 'campaigns/');
+            console.log(`  📸 Campaign media uploaded: ${mediaFile.originalname}`);
+        }
+        if (!mediaUrl) {
+            return res.status(400).json({ message: 'media file or media_url is required' });
+        }
+
+        // ── Resolve thumbnail URL (file upload or body URL) — REQUIRED ──-
+        const thumbnailFile = req.files && req.files['thumbnail'] && req.files['thumbnail'][0];
+        let thumbnailUrl = req.body.thumbnail_url || null;
+        if (thumbnailFile) {
+            try {
+                thumbnailUrl = await uploadToR2(thumbnailFile, 'campaigns/thumbnails/');
+                console.log(`  🖼️ Campaign thumbnail uploaded: ${thumbnailFile.originalname}`);
+            } catch (uploadErr) {
+                // Rollback: clean up the media file we already uploaded
+                await deleteFromR2(mediaUrl);
+                throw uploadErr;
+            }
+        }
+        if (!thumbnailUrl) {
+            // Rollback: clean up media if we uploaded it
+            if (mediaFile) await deleteFromR2(mediaUrl);
+            return res.status(400).json({ message: 'thumbnail file or thumbnail_url is required' });
+        }
+
+        // Validate status
+        const allowedStatuses = ['draft', 'published', 'paused'];
+        const finalStatus = allowedStatuses.includes(status) ? status : 'draft';
+
+        const campId = 'camp_' + Date.now();
+        const now = new Date().toISOString();
+
+        let result;
+        try {
+            result = await pool.query(
+                `INSERT INTO ad_campaigns
+                   (id, target_type, target_id, media_url, media_type,
+                    thumbnail_url, start_date, end_date, priority, status,
+                    source_type, created_at, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                 RETURNING *`,
+                [
+                    campId,
+                    target_type,
+                    target_id,
+                    mediaUrl,
+                    media_type || 'video',
+                    thumbnailUrl,
+                    startParsed.toISOString(),
+                    endParsed.toISOString(),
+                    parseInt(priority) || 0,
+                    finalStatus,
+                    source_type || 'official',
+                    now,
+                    now,
+                ]
+            );
+        } catch (dbErr) {
+            // Atomic rollback: clean up uploaded files on DB failure
+            console.error('❌ DB insert failed, rolling back uploads...');
+            await deleteFromR2(mediaUrl);
+            await deleteFromR2(thumbnailUrl);
+            throw dbErr;
+        }
+
+        console.log(`✅ Campaign Created: ${campId}`);
+        return res.status(201).json({ campaign: result.rows[0] });
+    } catch (err) {
+        console.error('❌ POST /admin/campaigns error:', err);
+        return res.status(500).json({ message: 'Campaign creation failed: ' + err.message });
+    }
+});
+
+// ─── Admin: Update Campaign ─────────────────────────────────────────────────
+const CAMPAIGN_UPDATABLE_FIELDS = [
+    'target_type', 'target_id', 'media_url', 'media_type',
+    'thumbnail_url', 'start_date', 'end_date', 'priority', 'status', 'source_type',
+];
+
+app.put('/admin/campaigns/:id', authenticateToken, requireAdmin, campaignUploadMiddleware, async (req, res) => {
+    console.log(`✅ Campaign API Hit (PUT Update) id=${req.params.id}`);
+    try {
+        const campId = req.params.id;
+
+        const existing = await pool.query('SELECT * FROM ad_campaigns WHERE id = $1 LIMIT 1', [campId]);
+        if (existing.rowCount === 0) {
+            return res.status(404).json({ message: 'Campaign not found' });
+        }
+        const oldCampaign = existing.rows[0];
+
+        const updates = { ...req.body };
+
+        // Track old URLs for cleanup after successful update
+        let oldMediaUrl = null;
+        let oldThumbnailUrl = null;
+
+        // Handle new media upload
+        const mediaFile = req.files && req.files['media'] && req.files['media'][0];
+        if (mediaFile) {
+            oldMediaUrl = oldCampaign.media_url;
+            updates.media_url = await uploadToR2(mediaFile, 'campaigns/');
+            console.log(`  📸 Campaign media updated: ${mediaFile.originalname}`);
+        }
+
+        // Handle new thumbnail upload (if not provided, keep existing)
+        const thumbnailFile = req.files && req.files['thumbnail'] && req.files['thumbnail'][0];
+        if (thumbnailFile) {
+            try {
+                oldThumbnailUrl = oldCampaign.thumbnail_url;
+                updates.thumbnail_url = await uploadToR2(thumbnailFile, 'campaigns/thumbnails/');
+                console.log(`  🖼️ Campaign thumbnail updated: ${thumbnailFile.originalname}`);
+            } catch (uploadErr) {
+                // Rollback: clean up new media if we uploaded one
+                if (mediaFile && updates.media_url) await deleteFromR2(updates.media_url);
+                throw uploadErr;
+            }
+        } else if (updates.thumbnail_url) {
+            // Allow URL-based thumbnail update from body
+            oldThumbnailUrl = oldCampaign.thumbnail_url;
+        }
+
+        // Validate dates if provided
+        if (updates.start_date) {
+            const sd = new Date(updates.start_date);
+            if (isNaN(sd.getTime())) return res.status(400).json({ message: 'Invalid start_date' });
+            updates.start_date = sd.toISOString();
+        }
+        if (updates.end_date) {
+            const ed = new Date(updates.end_date);
+            if (isNaN(ed.getTime())) return res.status(400).json({ message: 'Invalid end_date' });
+            updates.end_date = ed.toISOString();
+        }
+
+        // Validate status if provided
+        if (updates.status) {
+            const allowedStatuses = ['draft', 'published', 'paused'];
+            if (!allowedStatuses.includes(updates.status)) {
+                return res.status(400).json({ message: `Invalid status: ${updates.status}. Allowed: ${allowedStatuses.join(', ')}` });
+            }
+        }
+
+        // Validate target if changed
+        if (updates.target_type || updates.target_id) {
+            const tType = updates.target_type || oldCampaign.target_type;
+            const tId = updates.target_id || oldCampaign.target_id;
+            const validator = TargetValidators[tType];
+            if (!validator) {
+                return res.status(400).json({ message: `Unsupported target_type: ${tType}` });
+            }
+            const valid = await validator(tId);
+            if (!valid) {
+                return res.status(400).json({ message: `Target ${tType} with id ${tId} not found or unavailable` });
+            }
+        }
+
+        // Parse priority to int if provided
+        if (updates.priority !== undefined) {
+            updates.priority = parseInt(updates.priority) || 0;
+        }
+
+        const { text: setClauses, values, nextIndex } = buildSetClause(updates, CAMPAIGN_UPDATABLE_FIELDS, 1);
+        if (!setClauses) {
+            return res.status(400).json({ message: 'No valid fields to update' });
+        }
+
+        const query = `
+            UPDATE ad_campaigns
+            SET ${setClauses}, updated_at = $${nextIndex}
+            WHERE id = $${nextIndex + 1}
+            RETURNING *
+        `;
+        values.push(new Date().toISOString(), campId);
+
+        const result = await pool.query(query, values);
+        if (result.rowCount === 0) {
+            return res.status(500).json({ message: 'Failed to update campaign' });
+        }
+
+        // Async cleanup: delete old files that were replaced
+        if (oldMediaUrl) deleteFromR2(oldMediaUrl).catch(() => { });
+        if (oldThumbnailUrl) deleteFromR2(oldThumbnailUrl).catch(() => { });
+
+        console.log(`✅ Campaign Updated: ${campId}`);
+        return res.status(200).json({ campaign: result.rows[0] });
+    } catch (err) {
+        console.error('❌ PUT /admin/campaigns/:id error:', err);
+        return res.status(500).json({ message: 'Campaign update failed: ' + err.message });
+    }
+});
+
+// ─── Admin: Delete Campaign ─────────────────────────────────────────────────
+app.delete('/admin/campaigns/:id', authenticateToken, requireAdmin, async (req, res) => {
+    console.log(`✅ Campaign API Hit (DELETE) id=${req.params.id}`);
+    try {
+        const campId = req.params.id;
+
+        // Fetch campaign before deleting to get file URLs for cleanup
+        const existing = await pool.query(
+            'SELECT media_url, thumbnail_url FROM ad_campaigns WHERE id = $1 LIMIT 1',
+            [campId]
+        );
+        if (existing.rowCount === 0) {
+            return res.status(404).json({ message: 'Campaign not found' });
+        }
+        const { media_url, thumbnail_url } = existing.rows[0];
+
+        const result = await pool.query('DELETE FROM ad_campaigns WHERE id = $1 RETURNING id', [campId]);
+        if (result.rowCount === 0) {
+            return res.status(404).json({ message: 'Campaign not found' });
+        }
+
+        // Async cleanup: delete associated files from R2
+        if (media_url) deleteFromR2(media_url).catch(() => { });
+        if (thumbnail_url) deleteFromR2(thumbnail_url).catch(() => { });
+
+        console.log(`✅ Campaign Deleted: ${campId}`);
+        return res.status(200).json({ message: 'Campaign deleted successfully' });
+    } catch (err) {
+        console.error('❌ DELETE /admin/campaigns/:id error:', err);
+        return res.status(500).json({ message: 'Campaign deletion failed: ' + err.message });
+    }
+});
+
+// ─── Admin: List All Campaigns ──────────────────────────────────────────────
+app.get('/admin/campaigns', authenticateToken, requireAdmin, async (req, res) => {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    try {
+        const [campsResult, countResult] = await Promise.all([
+            pool.query(
+                `SELECT * FROM ad_campaigns
+                 ORDER BY created_at DESC
+                 LIMIT $1 OFFSET $2`,
+                [limit, offset]
+            ),
+            pool.query('SELECT COUNT(*) FROM ad_campaigns'),
+        ]);
+
+        return res.status(200).json({
+            campaigns: campsResult.rows,
+            total: parseInt(countResult.rows[0].count),
+            page,
+            limit,
+        });
+    } catch (err) {
+        console.error('❌ GET /admin/campaigns error:', err);
+        return res.status(500).json({ message: 'Failed to fetch campaigns: ' + err.message });
+    }
+});
+
+// ─── Public: Get Active Campaigns ───────────────────────────────────────────
+// Uses SQL JOIN-based validation — zero N+1 queries.
+// 'active' is derived: status = 'published' AND NOW() within date window.
+app.get('/campaigns', async (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+    const offset = parseInt(req.query.offset) || 0;
+
+    try {
+        const [campsResult, countResult] = await Promise.all([
+            pool.query(
+                `SELECT ad.id, ad.target_type, ad.target_id,
+                        ad.media_url, ad.media_type, ad.thumbnail_url, ad.priority
+                 FROM   ad_campaigns ad
+                 LEFT JOIN cars c ON c.id = ad.target_id AND ad.target_type = 'car'
+                 WHERE  ad.status = 'published'
+                   AND  NOW() BETWEEN ad.start_date AND ad.end_date
+                   AND  ad.thumbnail_url IS NOT NULL
+                   AND  (ad.target_type = 'car' AND c.is_available = true)
+                 ORDER BY ad.priority DESC, ad.created_at DESC
+                 LIMIT $1 OFFSET $2`,
+                [limit, offset]
+            ),
+            pool.query(
+                `SELECT COUNT(*) FROM ad_campaigns ad
+                 LEFT JOIN cars c ON c.id = ad.target_id AND ad.target_type = 'car'
+                 WHERE  ad.status = 'published'
+                   AND  NOW() BETWEEN ad.start_date AND ad.end_date
+                   AND  ad.thumbnail_url IS NOT NULL
+                   AND  (ad.target_type = 'car' AND c.is_available = true)`
+            ),
+        ]);
+
+        return res.status(200).json({
+            campaigns: campsResult.rows.map(formatCampaignResponse),
+            total: parseInt(countResult.rows[0].count),
+        });
+    } catch (err) {
+        console.error('❌ GET /campaigns error:', err);
+        return res.status(500).json({ message: 'Failed to fetch campaigns: ' + err.message });
+    }
+});
+
+// ─── Public: Track Campaign Interaction ─────────────────────────────────────
+app.post('/campaigns/:id/track', async (req, res) => {
+    const campId = req.params.id;
+    const { event_type } = req.body;
+    const userId = extractUserId(req); // nullable — guests can track too
+
+    if (!event_type || !['click', 'view'].includes(event_type)) {
+        return res.status(400).json({ message: 'event_type must be "click" or "view"' });
+    }
+
+    try {
+        // Validate campaign exists
+        const campCheck = await pool.query(
+            'SELECT id FROM ad_campaigns WHERE id = $1 LIMIT 1',
+            [campId]
+        );
+        if (campCheck.rowCount === 0) {
+            return res.status(404).json({ message: 'Campaign not found' });
+        }
+
+        const trackId = 'track_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+        await pool.query(
+            `INSERT INTO campaign_tracking (id, campaign_id, user_id, event_type, created_at)
+             VALUES ($1, $2, $3, $4, NOW())`,
+            [trackId, campId, userId, event_type]
+        );
+
+        console.log(`✅ Campaign Tracked: ${event_type} on ${campId}`);
+        return res.status(200).json({ success: true });
+    } catch (err) {
+        console.error('❌ POST /campaigns/:id/track error:', err);
+        return res.status(500).json({ message: 'Tracking failed: ' + err.message });
     }
 });
 
