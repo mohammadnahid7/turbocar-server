@@ -293,6 +293,72 @@ function buildSetClause(updates, allowedFields, startIndex = 1) {
     return { text: parts.join(', '), values, nextIndex: idx };
 }
 
+// ─── Helper: escape special SQL LIKE metacharacters ─────────────────────────
+// Prevents users from injecting wildcards (%, _) that cause expensive scans.
+function escapeLikeInput(str) {
+    return str.replace(/[%_\\]/g, '\\$&');
+}
+
+// ─── Error Code Registry ────────────────────────────────────────────────────
+// Each catch block maps to a unique code. Developers can cross-reference codes
+// here. Users see only the code + a generic label — never raw err.message.
+const ERROR_CODES = {
+    ERR_AUTH_001: 'Login failed',
+    ERR_AUTH_002: 'Registration failed',
+    ERR_AUTH_003: 'Verification failed',
+    ERR_AUTH_004: 'Token refresh failed',
+    ERR_AUTH_005: 'Logout failed',
+    ERR_AUTH_006: 'Google check failed',
+    ERR_AUTH_007: 'Google registration failed',
+    ERR_PROF_001: 'Failed to fetch profile',
+    ERR_PROF_002: 'Profile update failed',
+    ERR_PROF_003: 'Photo upload failed',
+    ERR_CAR_001:  'Failed to fetch cars',
+    ERR_CAR_002:  'Car creation failed',
+    ERR_CAR_003:  'Car update failed',
+    ERR_CAR_004:  'Failed to fetch featured cars',
+    ERR_CAR_005:  'Search failed',
+    ERR_CAR_006:  'Suggestions failed',
+    ERR_CAR_007:  'Failed to fetch cars by brand',
+    ERR_CAR_008:  'Failed to fetch seller cars',
+    ERR_CAR_009:  'Failed to fetch car',
+    ERR_CAR_010:  'Failed to increment view',
+    ERR_CAR_011:  'Failed to delete car',
+    ERR_FAV_001:  'Failed to add favorite',
+    ERR_FAV_002:  'Failed to remove favorite',
+    ERR_FAV_003:  'Failed to fetch favorite IDs',
+    ERR_FAV_004:  'Failed to fetch favorite cars',
+    ERR_FAV_005:  'Failed to fetch favorites',
+    ERR_FAV_006:  'Favorites sync failed',
+    ERR_CHAT_001: 'Failed to fetch conversations',
+    ERR_CHAT_002: 'Failed to create conversation',
+    ERR_CHAT_003: 'Failed to fetch messages',
+    ERR_CHAT_004: 'Failed to send message',
+    ERR_CHAT_005: 'Failed to mark messages as read',
+    ERR_CHAT_006: 'Failed to fetch missed messages',
+    ERR_NOTIF_001:'Failed to fetch notifications',
+    ERR_NOTIF_002:'Failed to mark notification as read',
+    ERR_NOTIF_003:'Failed to mark all as read',
+    ERR_NOTIF_004:'Failed to delete notification',
+    ERR_NOTIF_005:'Failed to register device token',
+    ERR_CAMP_001: 'Campaign creation failed',
+    ERR_CAMP_002: 'Campaign update failed',
+    ERR_CAMP_003: 'Campaign deletion failed',
+    ERR_CAMP_004: 'Failed to fetch campaigns',
+    ERR_CAMP_005: 'Failed to fetch active campaigns',
+    ERR_CAMP_006: 'Tracking failed',
+};
+
+/**
+ * Returns a sanitised error response.
+ * Logs the real error server-side, returns only the code + label to the client.
+ */
+function safeError(res, code, err) {
+    const label = ERROR_CODES[code] || 'Internal server error';
+    console.error(`❌ [${code}] ${label}:`, err);
+    return res.status(500).json({ message: label, error_code: code });
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ROUTES
@@ -333,8 +399,7 @@ app.post('/auth/login', async (req, res) => {
         const tokens = generateTokens(user.user_id, user.token_version || 0);
         return res.status(200).json({ ...tokens, user: buildUserResponse(user) });
     } catch (err) {
-        console.error('❌ Login error:', err);
-        return res.status(500).json({ message: 'Login failed: ' + err.message });
+        return safeError(res, 'ERR_AUTH_001', err);
     }
 });
 
@@ -348,9 +413,12 @@ app.post('/auth/register', upload.single('user_avatar_url'), async (req, res) =>
         } = req.body;
         const finalEmail = user_email || email;
 
-        // ── Validate password is present and meets minimum length ────────
+        // ── Validate password is present and meets length bounds ─────────
         if (!user_password || user_password.length < 8) {
             return res.status(400).json({ message: 'Password is required and must be at least 8 characters' });
+        }
+        if (user_password.length > 72) {
+            return res.status(400).json({ message: 'Password must not exceed 72 characters' });
         }
 
         // Return existing user if already registered (idempotent)
@@ -405,8 +473,7 @@ app.post('/auth/register', upload.single('user_avatar_url'), async (req, res) =>
         const tokens = generateTokens(newUser.user_id, 0);
         return res.status(201).json({ ...tokens, user: buildUserResponse(newUser) });
     } catch (err) {
-        console.error('❌ Register error:', err);
-        return res.status(500).json({ message: 'Registration failed: ' + err.message });
+        return safeError(res, 'ERR_AUTH_002', err);
     }
 });
 
@@ -421,8 +488,7 @@ app.get(['/auth/verify', '/auth/me'], authenticateToken, async (req, res) => {
         console.log('✅ Verify/Me Success');
         return res.status(200).json({ user: buildUserResponse(result.rows[0]) });
     } catch (err) {
-        console.error('❌ Verify error:', err);
-        return res.status(500).json({ message: 'Verification failed: ' + err.message });
+        return safeError(res, 'ERR_AUTH_003', err);
     }
 });
 
@@ -474,8 +540,7 @@ app.post('/auth/logout', authenticateToken, async (req, res) => {
         console.log(`✅ Logout (tokens revoked) for: ${req.userId}`);
         return res.status(200).json({ message: 'Logged out successfully' });
     } catch (err) {
-        console.error('❌ Logout error:', err);
-        return res.status(500).json({ message: 'Logout failed: ' + err.message });
+        return safeError(res, 'ERR_AUTH_005', err);
     }
 });
 
@@ -502,8 +567,7 @@ app.get('/auth/google/check', async (req, res) => {
 
         return res.status(404).json({ message: 'User not found' });
     } catch (err) {
-        console.error('❌ Google check error:', err);
-        return res.status(500).json({ message: 'Google check failed: ' + err.message });
+        return safeError(res, 'ERR_AUTH_006', err);
     }
 });
 
@@ -569,8 +633,7 @@ app.post('/auth/google/register', upload.single('user_avatar_url'), async (req, 
         const tokens = generateTokens(newUser.user_id, newUser.token_version || 0);
         return res.status(201).json({ ...tokens, user: buildUserResponse(newUser) });
     } catch (err) {
-        console.error('❌ Google Register error:', err);
-        return res.status(500).json({ message: 'Google registration failed: ' + err.message });
+        return safeError(res, 'ERR_AUTH_007', err);
     }
 });
 
@@ -588,8 +651,7 @@ app.get('/profile', authenticateToken, async (req, res) => {
 
         return res.status(200).json({ profile: buildProfileResponse(result.rows[0]) });
     } catch (err) {
-        console.error('❌ Profile GET error:', err);
-        return res.status(500).json({ message: 'Failed to fetch profile: ' + err.message });
+        return safeError(res, 'ERR_PROF_001', err);
     }
 });
 
@@ -631,8 +693,7 @@ app.put('/profile', authenticateToken, upload.single('avatar'), async (req, res)
 
         return res.status(200).json({ profile: buildProfileResponse(result.rows[0]) });
     } catch (err) {
-        console.error('❌ Profile update error:', err);
-        return res.status(500).json({ message: 'Profile update failed: ' + err.message });
+        return safeError(res, 'ERR_PROF_002', err);
     }
 });
 
@@ -656,8 +717,7 @@ app.post('/profile/photo', upload.single('photo'), async (req, res) => {
 
         return res.status(200).json({ photo_url: photoUrl });
     } catch (err) {
-        console.error('❌ Profile photo upload error:', err);
-        return res.status(500).json({ message: 'Photo upload failed: ' + err.message });
+        return safeError(res, 'ERR_PROF_003', err);
     }
 });
 
@@ -666,19 +726,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ─── Cars Routes ──────────────────────────────────────────────────────────────
 
-// Helper: one-liner to add `is_favorited` via LEFT JOIN.
-// When userId is null the join condition never matches → is_favorited = false.
-const CAR_FAVORITE_SELECT = (userId) => `
-    SELECT c.*,
-           CASE WHEN f.car_id IS NOT NULL THEN true ELSE false END AS is_favorited
-    FROM   cars c
-    LEFT JOIN favorites f ON f.car_id = c.id AND f.user_id = ${userId ? `'${userId}'` : 'NULL'}
-`;
-// NOTE: userId is extracted from a verified JWT — not from user input — so
-//       inlining it here is safe. We still use parameterised queries everywhere
-//       else (brand, search, etc.) that accept user-provided strings.
-
-// Parameterised version used when userId comes alongside other bound params.
+// Parameterised JOIN macro used for all car queries.
+// Resolves seller_avatar and is_favorited in a single pass.
 const carFavJoin = `
     SELECT c.*,
            u.user_avatar_url AS seller_avatar,
@@ -690,7 +739,7 @@ const carFavJoin = `
 
 app.get('/cars', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     const offset = (page - 1) * limit;
     const userId = extractUserId(req);
 
@@ -712,8 +761,7 @@ app.get('/cars', async (req, res) => {
             limit,
         });
     } catch (err) {
-        console.error('❌ GET /cars error:', err);
-        return res.status(500).json({ message: 'Failed to fetch cars: ' + err.message });
+        return safeError(res, 'ERR_CAR_001', err);
     }
 });
 
@@ -751,6 +799,13 @@ app.post('/cars', authenticateToken, upload.array('images', 10), async (req, res
         const yearInt = parseInt(year) || 2024;
         const priceDec = parseFloat(price) || 0;
         const milesInt = parseInt(mileage) || 0;
+
+        // ── Numeric boundary validation ────────────────────────────────────
+        if (priceDec < 0) return res.status(400).json({ message: 'Price cannot be negative' });
+        if (milesInt < 0) return res.status(400).json({ message: 'Mileage cannot be negative' });
+        if (yearInt < 1886 || yearInt > new Date().getFullYear() + 2) {
+            return res.status(400).json({ message: 'Year is out of valid range' });
+        }
 
         const result = await pool.query(
             `INSERT INTO cars
@@ -808,8 +863,7 @@ app.post('/cars', authenticateToken, upload.array('images', 10), async (req, res
         console.log(`✅ Car Created: ${newCar.title}`);
         return res.status(201).json(formatCarResponse(newCar));
     } catch (err) {
-        console.error('❌ Car create error:', err);
-        return res.status(500).json({ message: 'Car creation failed: ' + err.message });
+        return safeError(res, 'ERR_CAR_002', err);
     }
 });
 
@@ -855,6 +909,14 @@ app.patch('/cars/:id', upload.array('new_images', 10), async (req, res) => {
         if (mileage !== undefined) { updates.mileage = parseInt(mileage); updates.mileage_km = parseInt(mileage); }
         if (year !== undefined) updates.year = parseInt(year);
         if (price !== undefined) { updates.price = parseFloat(price); updates.price_in_cents = Math.round(parseFloat(price) * 100); }
+
+        // ── Numeric boundary validation ────────────────────────────────────
+        if (updates.price !== undefined && updates.price < 0) return res.status(400).json({ message: 'Price cannot be negative' });
+        if (updates.mileage !== undefined && updates.mileage < 0) return res.status(400).json({ message: 'Mileage cannot be negative' });
+        if (updates.year !== undefined && (updates.year < 1886 || updates.year > new Date().getFullYear() + 2)) {
+            return res.status(400).json({ message: 'Year is out of valid range' });
+        }
+
         if (chat_only !== undefined) updates.chat_only = (chat_only === 'true' || chat_only === true);
         if (city !== undefined) { updates.city = city; updates.location = city; }
         if (description !== undefined) updates.description = description;
@@ -893,11 +955,18 @@ app.patch('/cars/:id', upload.array('new_images', 10), async (req, res) => {
         const result = await pool.query(query, values);
         if (result.rowCount === 0) return res.status(500).json({ message: 'Failed to update car' });
 
+        // Re-fetch the car using the standard carFavJoin to include is_favorited + seller_avatar
+        const freshResult = await pool.query(
+            `${carFavJoin}
+             WHERE c.id = $2
+             LIMIT 1`,
+            [userId, carId]
+        );
+
         console.log(`✅ Car Updated: ${result.rows[0].title}`);
-        return res.status(200).json(formatCarResponse(result.rows[0]));
+        return res.status(200).json(formatCarResponse(freshResult.rows[0] || result.rows[0]));
     } catch (err) {
-        console.error('❌ Car update error:', err);
-        return res.status(500).json({ message: 'Car update failed: ' + err.message });
+        return safeError(res, 'ERR_CAR_003', err);
     }
 });
 
@@ -905,7 +974,7 @@ app.patch('/cars/:id', upload.array('new_images', 10), async (req, res) => {
 // registered BEFORE the generic /cars/:id route so Express matches them first.
 
 app.get('/cars/featured', async (req, res) => {
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
     const userId = extractUserId(req);
     try {
         const result = await pool.query(
@@ -917,18 +986,17 @@ app.get('/cars/featured', async (req, res) => {
         );
         return res.status(200).json({ cars: result.rows.map(formatCarResponse) });
     } catch (err) {
-        console.error('❌ GET /cars/featured error:', err);
-        return res.status(500).json({ message: 'Failed to fetch featured cars: ' + err.message });
+        return safeError(res, 'ERR_CAR_004', err);
     }
 });
 
 app.get('/cars/search', async (req, res) => {
-    const query = (req.query.q || '').toLowerCase();
+    const rawQuery = (req.query.q || '').toLowerCase();
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     const offset = (page - 1) * limit;
     const userId = extractUserId(req);
-    const like = `%${query}%`;
+    const like = `%${escapeLikeInput(rawQuery)}%`;
 
     try {
         const [carsResult, countResult] = await Promise.all([
@@ -955,22 +1023,21 @@ app.get('/cars/search', async (req, res) => {
             total: parseInt(countResult.rows[0].count),
         });
     } catch (err) {
-        console.error('❌ GET /cars/search error:', err);
-        return res.status(500).json({ message: 'Search failed: ' + err.message });
+        return safeError(res, 'ERR_CAR_005', err);
     }
 });
 
 app.get('/cars/suggestions', async (req, res) => {
-    const query = (req.query.q || '').trim().toLowerCase();
+    const rawQuery = (req.query.q || '').trim().toLowerCase();
     const limit = Math.min(parseInt(req.query.limit) || 10, 20);
 
     // Edge case: empty or missing query — return immediately
-    if (!query) {
+    if (!rawQuery) {
         return res.status(200).json({ suggestions: [] });
     }
 
     try {
-        const likeQuery = `${query}%`; // Prefix only — no leading wildcard
+        const likeQuery = `${escapeLikeInput(rawQuery)}%`; // Prefix only — no leading wildcard
 
         const result = await pool.query(
             `SELECT DISTINCT text, type FROM (
@@ -994,15 +1061,14 @@ app.get('/cars/suggestions', async (req, res) => {
             })),
         });
     } catch (err) {
-        console.error('❌ GET /cars/suggestions error:', err);
-        return res.status(500).json({ message: 'Suggestions failed: ' + err.message });
+        return safeError(res, 'ERR_CAR_006', err);
     }
 });
 
 app.get('/cars/brand/:brand', async (req, res) => {
     const brand = decodeURIComponent(req.params.brand);
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     const offset = (page - 1) * limit;
     const userId = extractUserId(req);
 
@@ -1016,15 +1082,14 @@ app.get('/cars/brand/:brand', async (req, res) => {
         );
         return res.status(200).json({ cars: result.rows.map(formatCarResponse) });
     } catch (err) {
-        console.error('❌ GET /cars/brand error:', err);
-        return res.status(500).json({ message: 'Failed to fetch cars by brand: ' + err.message });
+        return safeError(res, 'ERR_CAR_007', err);
     }
 });
 
 app.get('/cars/seller/:sellerId', async (req, res) => {
     const sellerId = req.params.sellerId;
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     const offset = (page - 1) * limit;
     const userId = extractUserId(req);
 
@@ -1038,8 +1103,7 @@ app.get('/cars/seller/:sellerId', async (req, res) => {
         );
         return res.status(200).json({ cars: result.rows.map(formatCarResponse) });
     } catch (err) {
-        console.error('❌ GET /cars/seller error:', err);
-        return res.status(500).json({ message: 'Failed to fetch seller cars: ' + err.message });
+        return safeError(res, 'ERR_CAR_008', err);
     }
 });
 
@@ -1056,8 +1120,7 @@ app.get('/cars/:id', async (req, res) => {
 
         return res.status(200).json({ car: formatCarResponse(result.rows[0]) });
     } catch (err) {
-        console.error('❌ GET /cars/:id error:', err);
-        return res.status(500).json({ message: 'Failed to fetch car: ' + err.message });
+        return safeError(res, 'ERR_CAR_009', err);
     }
 });
 
@@ -1069,8 +1132,7 @@ app.post('/cars/:id/view', async (req, res) => {
         );
         return res.status(200).json({ message: 'View count incremented' });
     } catch (err) {
-        console.error('❌ POST /cars/:id/view error:', err);
-        return res.status(500).json({ message: 'Failed to increment view: ' + err.message });
+        return safeError(res, 'ERR_CAR_010', err);
     }
 });
 
@@ -1097,8 +1159,7 @@ app.delete('/cars/:id', async (req, res) => {
         console.log(`✅ Car Deleted: ${carId}`);
         return res.status(200).json({ message: 'Car deleted successfully' });
     } catch (err) {
-        console.error('❌ DELETE /cars/:id error:', err);
-        return res.status(500).json({ message: 'Failed to delete car: ' + err.message });
+        return safeError(res, 'ERR_CAR_011', err);
     }
 });
 
@@ -1159,8 +1220,7 @@ app.post('/favorites', async (req, res) => {
 
         return res.status(201).json({ favorite: result.rows[0] });
     } catch (err) {
-        console.error('❌ POST /favorites error:', err);
-        return res.status(500).json({ message: 'Failed to add favorite: ' + err.message });
+        return safeError(res, 'ERR_FAV_001', err);
     }
 });
 
@@ -1183,8 +1243,7 @@ app.delete('/favorites/:carId', async (req, res) => {
         console.log(`✅ Favorite Removed: car ${carId} for user ${userId}`);
         return res.status(200).json({ message: 'Removed from favorites' });
     } catch (err) {
-        console.error('❌ DELETE /favorites error:', err);
-        return res.status(500).json({ message: 'Failed to remove favorite: ' + err.message });
+        return safeError(res, 'ERR_FAV_002', err);
     }
 });
 
@@ -1202,8 +1261,7 @@ app.get('/favorites/ids', async (req, res) => {
         console.log(`✅ Favorite IDs: ${carIds.length} for user ${userId}`);
         return res.status(200).json({ car_ids: carIds });
     } catch (err) {
-        console.error('❌ GET /favorites/ids error:', err);
-        return res.status(500).json({ message: 'Failed to fetch favorite IDs: ' + err.message });
+        return safeError(res, 'ERR_FAV_003', err);
     }
 });
 
@@ -1213,14 +1271,17 @@ app.get('/favorites/cars', async (req, res) => {
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     const offset = (page - 1) * limit;
 
     try {
         const [carsResult, countResult] = await Promise.all([
             pool.query(
-                `SELECT c.*, true AS is_favorited
+                `SELECT c.*,
+                        u.user_avatar_url AS seller_avatar,
+                        true AS is_favorited
                  FROM cars c
+                 LEFT JOIN users u ON u.user_id = c.seller_id
                  INNER JOIN favorites f ON f.car_id = c.id AND f.user_id = $1
                  ORDER BY f.saved_at DESC
                  LIMIT $2 OFFSET $3`,
@@ -1240,8 +1301,7 @@ app.get('/favorites/cars', async (req, res) => {
             limit,
         });
     } catch (err) {
-        console.error('❌ GET /favorites/cars error:', err);
-        return res.status(500).json({ message: 'Failed to fetch favorite cars: ' + err.message });
+        return safeError(res, 'ERR_FAV_004', err);
     }
 });
 
@@ -1258,8 +1318,7 @@ app.get('/favorites', async (req, res) => {
         console.log(`✅ Favorites List: ${result.rowCount} for user ${userId}`);
         return res.status(200).json({ favorites: result.rows });
     } catch (err) {
-        console.error('❌ GET /favorites error:', err);
-        return res.status(500).json({ message: 'Failed to fetch favorites: ' + err.message });
+        return safeError(res, 'ERR_FAV_005', err);
     }
 });
 
@@ -1303,8 +1362,7 @@ app.post('/favorites/sync', async (req, res) => {
         console.log(`✅ Favorites Synced: ${synced.length} for user ${userId}`);
         return res.status(200).json({ favorites: synced });
     } catch (err) {
-        console.error('❌ POST /favorites/sync error:', err);
-        return res.status(500).json({ message: 'Favorites sync failed: ' + err.message });
+        return safeError(res, 'ERR_FAV_006', err);
     }
 });
 
@@ -1347,8 +1405,7 @@ app.get('/conversations', async (req, res) => {
         console.log(`✅ Conversations List: ${result.rowCount} found for ${userId}`);
         return res.status(200).json(result.rows);
     } catch (err) {
-        console.error('❌ GET /conversations error:', err);
-        return res.status(500).json({ message: 'Failed to fetch conversations: ' + err.message });
+        return safeError(res, 'ERR_CHAT_001', err);
     }
 });
 
@@ -1468,8 +1525,7 @@ app.post('/conversations', async (req, res) => {
 
         return res.status(201).json(newConversation);
     } catch (err) {
-        console.error('❌ POST /conversations error:', err);
-        return res.status(500).json({ message: 'Failed to create conversation: ' + err.message });
+        return safeError(res, 'ERR_CHAT_002', err);
     }
 });
 
@@ -1479,10 +1535,23 @@ app.get('/conversations/:id/messages', async (req, res) => {
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const conversationId = req.params.id;
-    const pageSize = parseInt(req.query.page_size) || 30;
+    const pageSize = Math.min(parseInt(req.query.page_size) || 30, 100);
     const before = req.query.before; // message ID cursor
 
     try {
+        // ── BOLA: Verify current user is a participant of this conversation ──
+        const ownerCheck = await pool.query(
+            'SELECT buyer_id, seller_id FROM conversations WHERE id = $1 LIMIT 1',
+            [conversationId]
+        );
+        if (ownerCheck.rowCount === 0) {
+            return res.status(404).json({ message: 'Conversation not found' });
+        }
+        const conv = ownerCheck.rows[0];
+        if (conv.buyer_id !== userId && conv.seller_id !== userId) {
+            return res.status(403).json({ message: 'Forbidden: You are not a participant of this conversation' });
+        }
+
         let messages;
 
         if (before) {
@@ -1525,8 +1594,7 @@ app.get('/conversations/:id/messages', async (req, res) => {
         console.log(`✅ Messages for ${conversationId}: ${messages.length} returned`);
         return res.status(200).json(messages);
     } catch (err) {
-        console.error('❌ GET /conversations/:id/messages error:', err);
-        return res.status(500).json({ message: 'Failed to fetch messages: ' + err.message });
+        return safeError(res, 'ERR_CHAT_003', err);
     }
 });
 
@@ -1552,6 +1620,11 @@ app.post('/conversations/:id/messages', async (req, res) => {
             return res.status(404).json({ message: 'Conversation not found' });
         }
         const conversation = convRes.rows[0];
+
+        // ── BOLA: Verify current user is a participant ──────────────────────
+        if (conversation.buyer_id !== userId && conversation.seller_id !== userId) {
+            return res.status(403).json({ message: 'Forbidden: You are not a participant of this conversation' });
+        }
 
         // Persist the message
         const msgId = 'msg_' + Date.now();
@@ -1628,8 +1701,7 @@ app.post('/conversations/:id/messages', async (req, res) => {
 
         return res.status(201).json(newMessage);
     } catch (err) {
-        console.error('❌ POST /conversations/:id/messages error:', err);
-        return res.status(500).json({ message: 'Failed to send message: ' + err.message });
+        return safeError(res, 'ERR_CHAT_004', err);
     }
 });
 
@@ -1642,11 +1714,17 @@ app.post('/conversations/:id/read', async (req, res) => {
 
     try {
         const convRes = await pool.query(
-            'SELECT id FROM conversations WHERE id = $1 LIMIT 1',
+            'SELECT id, buyer_id, seller_id FROM conversations WHERE id = $1 LIMIT 1',
             [conversationId]
         );
         if (convRes.rowCount === 0) {
             return res.status(404).json({ message: 'Conversation not found' });
+        }
+
+        // ── BOLA: Verify current user is a participant ──────────────────────
+        const convRow = convRes.rows[0];
+        if (convRow.buyer_id !== userId && convRow.seller_id !== userId) {
+            return res.status(403).json({ message: 'Forbidden: You are not a participant of this conversation' });
         }
 
         // Mark all messages NOT from the current user as 'read' and get back the updated rows
@@ -1714,8 +1792,7 @@ app.post('/conversations/:id/read', async (req, res) => {
         console.log(`✅ Messages marked as read in ${conversationId} by ${userId}`);
         return res.status(200).json({ message: 'Messages marked as read' });
     } catch (err) {
-        console.error('❌ POST /conversations/:id/read error:', err);
-        return res.status(500).json({ message: 'Failed to mark messages as read: ' + err.message });
+        return safeError(res, 'ERR_CHAT_005', err);
     }
 });
 
@@ -1748,8 +1825,7 @@ app.get('/messages/missed', async (req, res) => {
         console.log(`✅ Missed Messages: ${result.rowCount} since ${since}`);
         return res.status(200).json(result.rows);
     } catch (err) {
-        console.error('❌ GET /messages/missed error:', err);
-        return res.status(500).json({ message: 'Failed to fetch missed messages: ' + err.message });
+        return safeError(res, 'ERR_CHAT_006', err);
     }
 });
 
@@ -1906,7 +1982,7 @@ app.get('/notifications', async (req, res) => {
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 30;
+    const limit = Math.min(parseInt(req.query.limit) || 30, 50);
     const offset = (page - 1) * limit;
 
     try {
@@ -1936,8 +2012,7 @@ app.get('/notifications', async (req, res) => {
             limit,
         });
     } catch (err) {
-        console.error('❌ GET /notifications error:', err.message);
-        return res.status(500).json({ message: 'Failed to fetch notifications' });
+        return safeError(res, 'ERR_NOTIF_001', err);
     }
 });
 
@@ -1956,8 +2031,7 @@ app.patch('/notifications/:id/read', async (req, res) => {
         if (result.rowCount === 0) return res.status(404).json({ message: 'Notification not found' });
         return res.status(200).json(result.rows[0]);
     } catch (err) {
-        console.error('❌ PATCH /notifications/:id/read error:', err.message);
-        return res.status(500).json({ message: 'Failed to mark notification as read' });
+        return safeError(res, 'ERR_NOTIF_002', err);
     }
 });
 
@@ -1973,8 +2047,7 @@ app.patch('/notifications/read-all', async (req, res) => {
         );
         return res.status(200).json({ message: 'All notifications marked as read' });
     } catch (err) {
-        console.error('❌ PATCH /notifications/read-all error:', err.message);
-        return res.status(500).json({ message: 'Failed to mark all as read' });
+        return safeError(res, 'ERR_NOTIF_003', err);
     }
 });
 
@@ -1991,8 +2064,7 @@ app.delete('/notifications/:id', async (req, res) => {
         if (result.rowCount === 0) return res.status(404).json({ message: 'Notification not found' });
         return res.status(200).json({ message: 'Notification deleted' });
     } catch (err) {
-        console.error('❌ DELETE /notifications/:id error:', err.message);
-        return res.status(500).json({ message: 'Failed to delete notification' });
+        return safeError(res, 'ERR_NOTIF_004', err);
     }
 });
 
@@ -2013,8 +2085,7 @@ app.post('/device-tokens', async (req, res) => {
         );
         return res.status(200).json({ message: 'Device token registered' });
     } catch (err) {
-        console.error('❌ POST /device-tokens error:', err.message);
-        return res.status(500).json({ message: 'Failed to register device token' });
+        return safeError(res, 'ERR_NOTIF_005', err);
     }
 });
 
@@ -2222,8 +2293,7 @@ app.post('/admin/campaigns', authenticateToken, requireAdmin, campaignUploadMidd
         console.log(`✅ Campaign Created: ${campId}`);
         return res.status(201).json({ campaign: result.rows[0] });
     } catch (err) {
-        console.error('❌ POST /admin/campaigns error:', err);
-        return res.status(500).json({ message: 'Campaign creation failed: ' + err.message });
+        return safeError(res, 'ERR_CAMP_001', err);
     }
 });
 
@@ -2339,8 +2409,7 @@ app.put('/admin/campaigns/:id', authenticateToken, requireAdmin, campaignUploadM
         console.log(`✅ Campaign Updated: ${campId}`);
         return res.status(200).json({ campaign: result.rows[0] });
     } catch (err) {
-        console.error('❌ PUT /admin/campaigns/:id error:', err);
-        return res.status(500).json({ message: 'Campaign update failed: ' + err.message });
+        return safeError(res, 'ERR_CAMP_002', err);
     }
 });
 
@@ -2372,15 +2441,14 @@ app.delete('/admin/campaigns/:id', authenticateToken, requireAdmin, async (req, 
         console.log(`✅ Campaign Deleted: ${campId}`);
         return res.status(200).json({ message: 'Campaign deleted successfully' });
     } catch (err) {
-        console.error('❌ DELETE /admin/campaigns/:id error:', err);
-        return res.status(500).json({ message: 'Campaign deletion failed: ' + err.message });
+        return safeError(res, 'ERR_CAMP_003', err);
     }
 });
 
 // ─── Admin: List All Campaigns ──────────────────────────────────────────────
 app.get('/admin/campaigns', authenticateToken, requireAdmin, async (req, res) => {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     const offset = (page - 1) * limit;
 
     try {
@@ -2401,8 +2469,7 @@ app.get('/admin/campaigns', authenticateToken, requireAdmin, async (req, res) =>
             limit,
         });
     } catch (err) {
-        console.error('❌ GET /admin/campaigns error:', err);
-        return res.status(500).json({ message: 'Failed to fetch campaigns: ' + err.message });
+        return safeError(res, 'ERR_CAMP_004', err);
     }
 });
 
@@ -2443,8 +2510,7 @@ app.get('/campaigns', async (req, res) => {
             total: parseInt(countResult.rows[0].count),
         });
     } catch (err) {
-        console.error('❌ GET /campaigns error:', err);
-        return res.status(500).json({ message: 'Failed to fetch campaigns: ' + err.message });
+        return safeError(res, 'ERR_CAMP_005', err);
     }
 });
 
@@ -2478,8 +2544,7 @@ app.post('/campaigns/:id/track', async (req, res) => {
         console.log(`✅ Campaign Tracked: ${event_type} on ${campId}`);
         return res.status(200).json({ success: true });
     } catch (err) {
-        console.error('❌ POST /campaigns/:id/track error:', err);
-        return res.status(500).json({ message: 'Tracking failed: ' + err.message });
+        return safeError(res, 'ERR_CAMP_006', err);
     }
 });
 
